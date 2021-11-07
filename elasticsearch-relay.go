@@ -2,15 +2,13 @@ package main
 
 import (
 	"fmt"
-	"github.com/enriquebris/goconcurrentqueue"
-	"github.com/janatjak/elasticsearch-relay/worker"
-	"io"
-	"log"
-	"net/http"
+	"github.com/gin-gonic/gin"
 	"os"
 	"runtime"
 	"time"
 )
+
+// import _ "net/http/pprof"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -21,9 +19,9 @@ func main() {
 	baseUrl := os.Args[1]
 	fmt.Println("Starting with base url: ", baseUrl)
 
-	var queue = goconcurrentqueue.NewFIFO()
+	relayQueue := NewQueue()
 
-	go worker.Run(queue, baseUrl)
+	go RunWorker(relayQueue, baseUrl)
 
 	go func() {
 		for {
@@ -36,30 +34,28 @@ func main() {
 		}
 	}()
 
-	http.HandleFunc("/info", func(writer http.ResponseWriter, request *http.Request) {
-		writer.WriteHeader(200)
-		writer.Write([]byte(fmt.Sprintf("{\"count\":%d}", queue.GetLen())))
-	})
+	// debug
+	// go http.ListenAndServe(":8079", nil)
 
-	http.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
-		body, err := io.ReadAll(request.Body)
-		if err != nil {
-			writer.WriteHeader(500)
-			return
-		}
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()
+	// r := gin.Default()
 
-		err = queue.Enqueue(&worker.RelayRequest{
-			Method:  request.Method,
-			Url:     request.RequestURI,
-			Headers: request.Header,
-			Body:    body,
-			Retries: 0,
+	r.GET("/info", func(c *gin.Context) {
+		c.JSON(200, gin.H{
+			"count": relayQueue.Len(),
 		})
-		if err != nil {
-			writer.WriteHeader(500)
-			return
-		}
 	})
 
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	r.GET("/clean", func(c *gin.Context) {
+		relayQueue.Clean()
+		c.Status(200)
+	})
+
+	r.NoRoute(func(c *gin.Context) {
+		body, _ := c.GetRawData()
+		relayQueue.Push(c.Request, body)
+		c.Status(200)
+	})
+	r.Run()
 }

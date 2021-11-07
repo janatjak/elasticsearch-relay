@@ -5,10 +5,15 @@ import (
 	"github.com/gin-gonic/gin"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"time"
 )
 
 // import _ "net/http/pprof"
+
+func bToMb(b uint64) uint64 {
+	return b / 1024 / 1024
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -28,9 +33,12 @@ func main() {
 			// every 10 mins
 			time.Sleep(time.Minute * 10)
 
-			fmt.Println("Maintenance: Run GC Start")
 			runtime.GC()
-			fmt.Println("Maintenance: Run GC Finish")
+			debug.FreeOSMemory()
+
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			fmt.Printf("[Maintenance] Alloc: %vMB, TotalAlloc: %vMB, Sys: %vMB", bToMb(m.Alloc), bToMb(m.TotalAlloc), bToMb(m.Sys))
 		}
 	}()
 

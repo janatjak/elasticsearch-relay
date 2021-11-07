@@ -26,19 +26,21 @@ func RunWorker(queue *Queue, baseUrl string) {
 				break
 			}
 
+			relayRequest.Retries = relayRequest.Retries + 1
+
 			// prepare request
 			err := sendRequest(client, baseUrl, relayRequest)
 			if err != nil {
 				// fatal error
-				fmt.Println("ERROR send request: ", relayRequest.Url, err)
+				fmt.Println("[WORKER] ERROR send request: ", relayRequest.Url, relayRequest.Retries, err)
 
 				if relayRequest.Retries > 5 {
 					// max 5 retries
+					fmt.Println("[WORKER] Removed from queue: ", relayRequest.Url)
 					break
 				}
 
 				// put it back to queue
-				relayRequest.Retries++
 				queue.RePush(relayRequest)
 
 				// wait 10 sec -> server is down?

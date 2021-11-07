@@ -33,12 +33,13 @@ func main() {
 			// every 10 mins
 			time.Sleep(time.Minute * 10)
 
+			fmt.Println("[Maintenance] Start cleanup")
 			runtime.GC()
 			debug.FreeOSMemory()
 
 			var m runtime.MemStats
 			runtime.ReadMemStats(&m)
-			fmt.Printf("[Maintenance] Alloc: %vMB, TotalAlloc: %vMB, Sys: %vMB", bToMb(m.Alloc), bToMb(m.TotalAlloc), bToMb(m.Sys))
+			fmt.Printf("[Maintenance] Alloc: %vMB, TotalAlloc: %vMB, Sys: %vMB\n", bToMb(m.Alloc), bToMb(m.TotalAlloc), bToMb(m.Sys))
 		}
 	}()
 

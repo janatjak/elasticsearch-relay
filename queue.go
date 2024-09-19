@@ -16,7 +16,7 @@ type Queue struct {
 	head       *queuenode
 	tail       *queuenode
 	count      int
-	totalCount int
+	totalCount uint64
 	lock       *sync.Mutex
 }
 
@@ -68,7 +68,7 @@ func (q *Queue) Len() int {
 	return q.count
 }
 
-func (q *Queue) TotalCount() int {
+func (q *Queue) TotalCount() uint64 {
 	return q.totalCount
 }
 

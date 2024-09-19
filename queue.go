@@ -11,15 +11,16 @@ type queuenode struct {
 	next *queuenode
 }
 
-//	A go-routine safe FIFO (first in first out) data stucture.
+// A go-routine safe FIFO (first in first out) data stucture.
 type Queue struct {
-	head  *queuenode
-	tail  *queuenode
-	count int
-	lock  *sync.Mutex
+	head       *queuenode
+	tail       *queuenode
+	count      int
+	totalCount int
+	lock       *sync.Mutex
 }
 
-//	Creates a new pointer to a new queue.
+// Creates a new pointer to a new queue.
 func NewQueue() *Queue {
 	q := &Queue{}
 	q.lock = &sync.Mutex{}
@@ -59,17 +60,21 @@ func (q *Queue) Clean() {
 	runtime.GC()
 }
 
-//	Returns the number of elements in the queue (i.e. size/length)
-//	go-routine safe.
+// Returns the number of elements in the queue (i.e. size/length)
+// go-routine safe.
 func (q *Queue) Len() int {
 	q.lock.Lock()
 	defer q.lock.Unlock()
 	return q.count
 }
 
-//	Pushes/inserts a value at the end/tail of the queue.
-//	Note: this function does mutate the queue.
-//	go-routine safe.
+func (q *Queue) TotalCount() int {
+	return q.totalCount
+}
+
+// Pushes/inserts a value at the end/tail of the queue.
+// Note: this function does mutate the queue.
+// go-routine safe.
 func (q *Queue) push(item interface{}) {
 	q.lock.Lock()
 	defer q.lock.Unlock()
@@ -84,12 +89,13 @@ func (q *Queue) push(item interface{}) {
 		q.tail = n
 	}
 	q.count++
+	q.totalCount++
 }
 
-//	Returns the value at the front of the queue.
-//	i.e. the oldest value in the queue.
-//	Note: this function does mutate the queue.
-//	go-routine safe.
+// Returns the value at the front of the queue.
+// i.e. the oldest value in the queue.
+// Note: this function does mutate the queue.
+// go-routine safe.
 func (q *Queue) pull() interface{} {
 	q.lock.Lock()
 	defer q.lock.Unlock()

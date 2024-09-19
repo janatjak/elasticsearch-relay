@@ -52,12 +52,12 @@ func main() {
 
 	r.GET("/info", func(c *gin.Context) {
 		c.JSON(200, gin.H{
-			"count": relayQueue.Len(),
+			"count":      relayQueue.Len(),
+			"totalCount": relayQueue.TotalCount(),
 		})
 	})
 
-	r.GET("/clean", func(c *gin.Context) {
-		relayQueue.Clean()
+	r.GET("/health-check", func(c *gin.Context) {
 		c.Status(200)
 	})
 

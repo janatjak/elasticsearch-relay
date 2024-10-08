@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -21,12 +22,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	debugMode := os.Getenv("APP_DEBUG") == "1"
+
 	baseUrl := os.Args[1]
 	fmt.Println("Starting with base url: ", baseUrl)
 
 	relayQueue := NewQueue()
 
-	go RunWorker(relayQueue, baseUrl)
+	go RunWorker(relayQueue, baseUrl, debugMode)
 
 	go func() {
 		for {
@@ -62,9 +65,14 @@ func main() {
 	})
 
 	r.NoRoute(func(c *gin.Context) {
+		id := uuid.New()
 		body, _ := c.GetRawData()
-		relayQueue.Push(c.Request, body)
+		relayQueue.Push(id, c.Request, body)
 		c.Status(200)
+
+		if debugMode {
+			fmt.Println("[Server] Request", id, "accepted: ", c.Request.RequestURI)
+		}
 	})
 	r.Run()
 }

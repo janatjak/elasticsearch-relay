@@ -2,11 +2,13 @@ package main
 
 import (
 	"fmt"
+	"github.com/google/uuid"
 	"net/http"
 	"time"
 )
 
 type RelayRequest struct {
+	Uuid    uuid.UUID
 	Method  string
 	Url     string
 	Headers map[string][]string
@@ -14,7 +16,7 @@ type RelayRequest struct {
 	Retries uint8
 }
 
-func RunWorker(queue *Queue, baseUrl string) {
+func RunWorker(queue *Queue, baseUrl string, debug bool) {
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 	}
@@ -32,7 +34,7 @@ func RunWorker(queue *Queue, baseUrl string) {
 			err := sendRequest(client, baseUrl, relayRequest)
 			if err != nil {
 				// fatal error
-				fmt.Println("[WORKER] ERROR send request: ", relayRequest.Url, relayRequest.Retries, err)
+				fmt.Println("[WORKER] ERROR send request", relayRequest.Uuid, ": ", relayRequest.Url, relayRequest.Retries, err)
 
 				if relayRequest.Retries > 5 {
 					// max 5 retries
@@ -46,6 +48,8 @@ func RunWorker(queue *Queue, baseUrl string) {
 				// wait 10 sec -> server is down?
 				time.Sleep(time.Second * 10)
 				break
+			} else if debug {
+				fmt.Println("[WORKER] SUCCESS send request", relayRequest.Uuid.String(), ": ", relayRequest.Url)
 			}
 		}
 

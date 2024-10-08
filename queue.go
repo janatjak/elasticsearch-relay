@@ -1,6 +1,7 @@
 package main
 
 import (
+	"github.com/google/uuid"
 	"net/http"
 	"runtime"
 	"sync"
@@ -27,8 +28,9 @@ func NewQueue() *Queue {
 	return q
 }
 
-func (q *Queue) Push(req *http.Request, body []byte) {
+func (q *Queue) Push(uuid uuid.UUID, req *http.Request, body []byte) {
 	x := &RelayRequest{
+		Uuid:    uuid,
 		Method:  req.Method,
 		Url:     req.RequestURI,
 		Headers: req.Header.Clone(),

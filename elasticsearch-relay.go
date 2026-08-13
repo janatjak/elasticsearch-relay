@@ -27,9 +27,14 @@ func main() {
 	baseUrl := os.Args[1]
 	fmt.Println("Starting with base url: ", baseUrl)
 
+	victoriaLogsUrl := os.Getenv("VICTORIALOGS_URL")
+	if victoriaLogsUrl != "" {
+		fmt.Println("Starting with VictoriaLogs url: ", victoriaLogsUrl)
+	}
+
 	relayQueue := NewQueue()
 
-	go RunWorker(relayQueue, baseUrl, debugMode)
+	go RunWorker(relayQueue, baseUrl, victoriaLogsUrl, debugMode)
 
 	go func() {
 		for {

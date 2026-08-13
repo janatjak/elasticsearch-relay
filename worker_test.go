@@ -54,7 +54,43 @@ func TestBuildVictoriaLogsBodyDoc(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	want := "{\"create\":{\"_index\":\"myindex\"}}\n{\"message\":\"test\",\"level\":\"info\"}\n"
+	want := "{\"create\":{\"_index\":\"myindex\"}}\n{\"_msg\":\"test\",\"level\":\"info\",\"message\":\"test\"}\n"
+	if string(body) != want {
+		t.Errorf("buildVictoriaLogsBody = %q, want %q", body, want)
+	}
+}
+
+func TestBuildVictoriaLogsBodyDocWithoutMessage(t *testing.T) {
+	req := &RelayRequest{
+		Method: "POST",
+		Url:    "/myindex/_doc/123",
+		Body:   []byte(`{"level":"info"}`),
+	}
+
+	body, err := buildVictoriaLogsBody(vlKindDoc, req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := "{\"create\":{\"_index\":\"myindex\"}}\n{\"_msg\":\"missing _msg\",\"level\":\"info\"}\n"
+	if string(body) != want {
+		t.Errorf("buildVictoriaLogsBody = %q, want %q", body, want)
+	}
+}
+
+func TestBuildVictoriaLogsBodyDocWithMsg(t *testing.T) {
+	req := &RelayRequest{
+		Method: "POST",
+		Url:    "/myindex/_doc/123",
+		Body:   []byte(`{"message":"test","_msg":"already here"}`),
+	}
+
+	body, err := buildVictoriaLogsBody(vlKindDoc, req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := "{\"create\":{\"_index\":\"myindex\"}}\n{\"message\":\"test\",\"_msg\":\"already here\"}\n"
 	if string(body) != want {
 		t.Errorf("buildVictoriaLogsBody = %q, want %q", body, want)
 	}
@@ -73,7 +109,8 @@ func TestBuildVictoriaLogsBodyDocInvalidJson(t *testing.T) {
 }
 
 func TestBuildVictoriaLogsBodyBulkPassthrough(t *testing.T) {
-	raw := "{\"index\":{\"_index\":\"myindex\"}}\n{\"message\":\"bulk test\"}\n"
+	// documents that already have _msg stay untouched
+	raw := "{\"index\":{\"_index\":\"myindex\"}}\n{\"_msg\":\"bulk test\"}\n"
 	req := &RelayRequest{
 		Method: "POST",
 		Url:    "/_bulk",
@@ -86,6 +123,29 @@ func TestBuildVictoriaLogsBodyBulkPassthrough(t *testing.T) {
 	}
 	if string(body) != raw {
 		t.Errorf("bulk body changed: %q, want %q", body, raw)
+	}
+}
+
+func TestBuildVictoriaLogsBodyBulkAddsMsg(t *testing.T) {
+	raw := "{\"index\":{\"_index\":\"myindex\"}}\n{\"message\":\"bulk test\"}\n" +
+		"{\"delete\":{\"_index\":\"myindex\",\"_id\":\"1\"}}\n" +
+		"{\"create\":{}}\n{\"message\":\"second\"}"
+	req := &RelayRequest{
+		Method: "POST",
+		Url:    "/_bulk",
+		Body:   []byte(raw),
+	}
+
+	body, err := buildVictoriaLogsBody(vlKindBulk, req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := "{\"index\":{\"_index\":\"myindex\"}}\n{\"_msg\":\"bulk test\",\"message\":\"bulk test\"}\n" +
+		"{\"delete\":{\"_index\":\"myindex\",\"_id\":\"1\"}}\n" +
+		"{\"create\":{}}\n{\"_msg\":\"second\",\"message\":\"second\"}\n"
+	if string(body) != want {
+		t.Errorf("bulk body = %q, want %q", body, want)
 	}
 }
 
@@ -103,7 +163,7 @@ func gzipBytes(t *testing.T, data string) []byte {
 }
 
 func TestBuildVictoriaLogsBodyGzip(t *testing.T) {
-	raw := "{\"index\":{\"_index\":\"myindex\"}}\n{\"message\":\"bulk test\"}\n"
+	raw := "{\"index\":{\"_index\":\"myindex\"}}\n{\"_msg\":\"bulk test\"}\n"
 	req := &RelayRequest{
 		Method:  "POST",
 		Url:     "/_bulk",
@@ -204,8 +264,8 @@ func TestVlBatcherFlush(t *testing.T) {
 	if req.auth != wantAuth {
 		t.Errorf("Authorization = %q, want %q", req.auth, wantAuth)
 	}
-	wantBody := "{\"create\":{\"_index\":\"myindex\"}}\n{\"message\":\"single doc\"}\n" +
-		"{\"index\":{\"_index\":\"myindex\"}}\n{\"message\":\"bulk test\"}\n"
+	wantBody := "{\"create\":{\"_index\":\"myindex\"}}\n{\"_msg\":\"single doc\",\"message\":\"single doc\"}\n" +
+		"{\"index\":{\"_index\":\"myindex\"}}\n{\"_msg\":\"bulk test\",\"message\":\"bulk test\"}\n"
 	if req.body != wantBody {
 		t.Errorf("body = %q, want %q", req.body, wantBody)
 	}

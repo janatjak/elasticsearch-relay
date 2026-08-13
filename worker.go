@@ -123,7 +123,7 @@ func buildVictoriaLogsBody(kind string, relayRequest *RelayRequest) ([]byte, err
 
 	if kind == vlKindBulk {
 		// bulk body is already in the NDJSON format VictoriaLogs accepts
-		return rawBody, nil
+		return transformBulkBody(rawBody), nil
 	}
 
 	// single _doc insert -> wrap into a one-item bulk payload
@@ -137,6 +137,7 @@ func buildVictoriaLogsBody(kind string, relayRequest *RelayRequest) ([]byte, err
 	if err != nil {
 		return nil, err
 	}
+	docJson = ensureMsgField(docJson)
 
 	action, err := json.Marshal(map[string]map[string]string{
 		"create": {"_index": index},
@@ -151,6 +152,63 @@ func buildVictoriaLogsBody(kind string, relayRequest *RelayRequest) ([]byte, err
 	body.Write(docJson)
 	body.WriteByte('\n')
 	return body.Bytes(), nil
+}
+
+// VictoriaLogs requires the _msg field in every document
+const vlDefaultMsg = "missing _msg"
+
+func ensureMsgField(doc []byte) []byte {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(doc, &fields); err != nil {
+		// not an object -> leave it to VictoriaLogs
+		return doc
+	}
+	if _, ok := fields["_msg"]; ok {
+		return doc
+	}
+
+	// fallback to the "message" field (only when it is a string)
+	if message, ok := fields["message"]; ok && len(message) > 0 && message[0] == '"' {
+		fields["_msg"] = message
+	} else {
+		fields["_msg"] = json.RawMessage(`"` + vlDefaultMsg + `"`)
+	}
+
+	out, err := json.Marshal(fields)
+	if err != nil {
+		return doc
+	}
+	return out
+}
+
+// Adds the _msg field to document lines of a bulk body. Action lines
+// (create/index/delete/...) are kept as they are.
+func transformBulkBody(rawBody []byte) []byte {
+	var out bytes.Buffer
+	isDocLine := false
+	for _, line := range bytes.Split(rawBody, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+
+		if isDocLine {
+			line = ensureMsgField(line)
+			isDocLine = false
+		} else {
+			// action line; delete is not followed by a document line
+			var action map[string]json.RawMessage
+			isDelete := false
+			if err := json.Unmarshal(line, &action); err == nil {
+				_, isDelete = action["delete"]
+			}
+			isDocLine = !isDelete
+		}
+
+		out.Write(line)
+		out.WriteByte('\n')
+	}
+	return out.Bytes()
 }
 
 func decodeRequestBody(relayRequest *RelayRequest) ([]byte, error) {

@@ -7,6 +7,7 @@ HTTP relay pro Elasticsearch. Přijme jakýkoli požadavek (typicky `POST /{inde
 - Každý příchozí požadavek se přepošle do Elasticsearch (`baseUrl` z argumentu) v původní podobě, včetně hlaviček. Při chybě spojení se opakuje (max 5×, s 10s pauzou).
 - Pokud je nastavena `VICTORIALOGS_URL`, posílají se `POST /{index}/_doc/{id}` a `POST /_bulk` požadavky **navíc** i do VictoriaLogs:
   - jednotlivé `_doc` dokumenty se převádí na bulk formát,
+  - dokumentům bez pole `_msg` (VictoriaLogs ho vyžaduje) se doplní — hodnota se vezme z pole `message`, a když chybí i to, použije se `"missing _msg"`,
   - vše se hromadí do jednoho payloadu a odesílá na `/insert/elasticsearch/_bulk` max. jednou za 30 s (nebo dřív při překročení 4 MB),
   - při nedostupnosti VictoriaLogs se neodeslaný buffer drží do 32 MB, pak se zahodí (best-effort).
 

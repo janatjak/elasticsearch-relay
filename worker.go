@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"github.com/google/uuid"
@@ -23,6 +24,11 @@ type RelayRequest struct {
 func RunWorker(queue *Queue, baseUrl string, victoriaLogsUrl string, debug bool) {
 	client := &http.Client{
 		Timeout: 10 * time.Second,
+	}
+
+	var batcher *vlBatcher
+	if victoriaLogsUrl != "" {
+		batcher = newVlBatcher(client, victoriaLogsUrl, debug)
 	}
 
 	for {
@@ -57,17 +63,17 @@ func RunWorker(queue *Queue, baseUrl string, victoriaLogsUrl string, debug bool)
 					fmt.Println("[WORKER] SUCCESS send request", relayRequest.Uuid.String(), ": ", relayRequest.Url)
 				}
 
-				if victoriaLogsUrl != "" {
+				if batcher != nil {
 					if kind := victoriaLogsKind(relayRequest); kind != vlKindNone {
-						errVl := sendToVictoriaLogs(client, victoriaLogsUrl, kind, relayRequest)
-						if errVl != nil {
-							fmt.Println("[WORKER] ERROR send request to VictoriaLogs", relayRequest.Uuid, ": ", relayRequest.Url, errVl)
-						} else if debug {
-							fmt.Println("[WORKER] SUCCESS send request to VictoriaLogs", relayRequest.Uuid.String(), ": ", relayRequest.Url)
-						}
+						batcher.Add(kind, relayRequest)
 					}
+					batcher.FlushIfDue()
 				}
 			}
+		}
+
+		if batcher != nil {
+			batcher.FlushIfDue()
 		}
 
 		client.CloseIdleConnections()
@@ -109,20 +115,22 @@ func splitRequestPath(url string) []string {
 }
 
 func buildVictoriaLogsBody(kind string, relayRequest *RelayRequest) ([]byte, error) {
+	// the batch buffer holds plain NDJSON, so compressed bodies must be decoded first
+	rawBody, err := decodeRequestBody(relayRequest)
+	if err != nil {
+		return nil, err
+	}
+
 	if kind == vlKindBulk {
 		// bulk body is already in the NDJSON format VictoriaLogs accepts
-		return relayRequest.Body, nil
+		return rawBody, nil
 	}
 
 	// single _doc insert -> wrap into a one-item bulk payload
-	if len(relayRequest.Headers["Content-Encoding"]) > 0 {
-		return nil, fmt.Errorf("cannot transform _doc request with Content-Encoding")
-	}
-
 	index := splitRequestPath(relayRequest.Url)[0]
 
 	var doc json.RawMessage
-	if err := json.Unmarshal(relayRequest.Body, &doc); err != nil {
+	if err := json.Unmarshal(rawBody, &doc); err != nil {
 		return nil, fmt.Errorf("invalid document body: %w", err)
 	}
 	docJson, err := json.Marshal(doc)
@@ -145,27 +153,114 @@ func buildVictoriaLogsBody(kind string, relayRequest *RelayRequest) ([]byte, err
 	return body.Bytes(), nil
 }
 
-func sendToVictoriaLogs(client *http.Client, victoriaLogsUrl string, kind string, relayRequest *RelayRequest) error {
+func decodeRequestBody(relayRequest *RelayRequest) ([]byte, error) {
+	encodings := relayRequest.Headers["Content-Encoding"]
+	if len(encodings) == 0 {
+		return relayRequest.Body, nil
+	}
+
+	switch encoding := encodings[0]; encoding {
+	case "", "identity":
+		return relayRequest.Body, nil
+	case "gzip":
+		reader, err := gzip.NewReader(bytes.NewReader(relayRequest.Body))
+		if err != nil {
+			return nil, err
+		}
+		defer reader.Close()
+		return io.ReadAll(reader)
+	default:
+		return nil, fmt.Errorf("unsupported Content-Encoding: %s", encoding)
+	}
+}
+
+const (
+	vlFlushInterval  = 30 * time.Second
+	vlFlushSizeLimit = 4 * 1024 * 1024
+	// when VictoriaLogs is down, the unsent buffer is dropped above this size
+	vlBufferMaxSize = 32 * 1024 * 1024
+)
+
+// Batches NDJSON lines of multiple requests into a single bulk request to
+// VictoriaLogs. Used only from the worker goroutine -> no locking.
+type vlBatcher struct {
+	client    *http.Client
+	url       string
+	buf       bytes.Buffer
+	lastFlush time.Time
+	debug     bool
+}
+
+func newVlBatcher(client *http.Client, victoriaLogsUrl string, debug bool) *vlBatcher {
+	return &vlBatcher{
+		client:    client,
+		url:       strings.TrimRight(victoriaLogsUrl, "/") + "/insert/elasticsearch/_bulk",
+		lastFlush: time.Now(),
+		debug:     debug,
+	}
+}
+
+func (b *vlBatcher) Add(kind string, relayRequest *RelayRequest) {
 	body, err := buildVictoriaLogsBody(kind, relayRequest)
 	if err != nil {
-		return err
+		fmt.Println("[WORKER] ERROR build VictoriaLogs body", relayRequest.Uuid, ": ", relayRequest.Url, err)
+		return
+	}
+	if len(body) == 0 {
+		return
 	}
 
-	url := strings.TrimRight(victoriaLogsUrl, "/") + "/insert/elasticsearch/_bulk"
-	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	b.buf.Write(body)
+	if body[len(body)-1] != '\n' {
+		b.buf.WriteByte('\n')
+	}
+
+	if b.buf.Len() >= vlFlushSizeLimit {
+		b.Flush()
+	}
+}
+
+func (b *vlBatcher) FlushIfDue() {
+	if b.buf.Len() > 0 && time.Since(b.lastFlush) >= vlFlushInterval {
+		b.Flush()
+	}
+}
+
+func (b *vlBatcher) Flush() {
+	if b.buf.Len() == 0 {
+		return
+	}
+
+	// both on success and on error: next flush attempt one interval from now
+	b.lastFlush = time.Now()
+
+	if err := b.send(); err != nil {
+		fmt.Println("[WORKER] ERROR send batch to VictoriaLogs: ", err)
+
+		// keep the buffer for the next flush attempt, unless it is too big
+		if b.buf.Len() > vlBufferMaxSize {
+			fmt.Println("[WORKER] VictoriaLogs buffer overflow, dropping", b.buf.Len(), "bytes")
+			b.buf.Reset()
+		}
+		return
+	}
+
+	if b.debug {
+		fmt.Println("[WORKER] SUCCESS send batch to VictoriaLogs: ", b.buf.Len(), "bytes")
+	}
+	b.buf.Reset()
+}
+
+func (b *vlBatcher) send() error {
+	req, err := http.NewRequest("POST", b.url, bytes.NewReader(b.buf.Bytes()))
 	if err != nil {
 		return err
 	}
-	// Authorization is intentionally not copied from the original request:
-	// the http client fills in basic auth from the userinfo in victoriaLogsUrl.
+	// Authorization is intentionally not copied from the original requests:
+	// the http client fills in basic auth from the userinfo in the url.
 	req.Header.Set("Content-Type", "application/json")
-	if kind == vlKindBulk {
-		if ce := relayRequest.Headers["Content-Encoding"]; len(ce) > 0 {
-			req.Header["Content-Encoding"] = ce
-		}
-	}
 
-	res, err := client.Do(req)
+	res, err := b.client.Do(req)
 	if res != nil {
 		defer res.Body.Close()
 	}

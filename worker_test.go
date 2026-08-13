@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -70,19 +72,6 @@ func TestBuildVictoriaLogsBodyDocInvalidJson(t *testing.T) {
 	}
 }
 
-func TestBuildVictoriaLogsBodyDocContentEncoding(t *testing.T) {
-	req := &RelayRequest{
-		Method:  "POST",
-		Url:     "/myindex/_doc/123",
-		Headers: map[string][]string{"Content-Encoding": {"gzip"}},
-		Body:    []byte("compressed"),
-	}
-
-	if _, err := buildVictoriaLogsBody(vlKindDoc, req); err == nil {
-		t.Error("expected error for Content-Encoding on _doc request")
-	}
-}
-
 func TestBuildVictoriaLogsBodyBulkPassthrough(t *testing.T) {
 	raw := "{\"index\":{\"_index\":\"myindex\"}}\n{\"message\":\"bulk test\"}\n"
 	req := &RelayRequest{
@@ -100,43 +89,180 @@ func TestBuildVictoriaLogsBodyBulkPassthrough(t *testing.T) {
 	}
 }
 
-func TestSendToVictoriaLogs(t *testing.T) {
-	var gotPath, gotAuth, gotBody string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		gotAuth = r.Header.Get("Authorization")
-		body, _ := io.ReadAll(r.Body)
-		gotBody = string(body)
-		w.WriteHeader(200)
-	}))
-	defer server.Close()
+func gzipBytes(t *testing.T, data string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	writer := gzip.NewWriter(&buf)
+	if _, err := writer.Write([]byte(data)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
 
-	serverUrl, _ := url.Parse(server.URL)
-	serverUrl.User = url.UserPassword("user", "pass")
-
+func TestBuildVictoriaLogsBodyGzip(t *testing.T) {
+	raw := "{\"index\":{\"_index\":\"myindex\"}}\n{\"message\":\"bulk test\"}\n"
 	req := &RelayRequest{
+		Method:  "POST",
+		Url:     "/_bulk",
+		Headers: map[string][]string{"Content-Encoding": {"gzip"}},
+		Body:    gzipBytes(t, raw),
+	}
+
+	body, err := buildVictoriaLogsBody(vlKindBulk, req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(body) != raw {
+		t.Errorf("gzip bulk body = %q, want %q", body, raw)
+	}
+}
+
+func TestBuildVictoriaLogsBodyUnsupportedEncoding(t *testing.T) {
+	req := &RelayRequest{
+		Method:  "POST",
+		Url:     "/_bulk",
+		Headers: map[string][]string{"Content-Encoding": {"br"}},
+		Body:    []byte("compressed"),
+	}
+
+	if _, err := buildVictoriaLogsBody(vlKindBulk, req); err == nil {
+		t.Error("expected error for unsupported Content-Encoding")
+	}
+}
+
+type vlTestServer struct {
+	server   *httptest.Server
+	status   int
+	requests []struct {
+		path string
+		auth string
+		body string
+	}
+}
+
+func newVlTestServer() *vlTestServer {
+	s := &vlTestServer{status: 200}
+	s.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		s.requests = append(s.requests, struct {
+			path string
+			auth string
+			body string
+		}{r.URL.Path, r.Header.Get("Authorization"), string(body)})
+		w.WriteHeader(s.status)
+	}))
+	return s
+}
+
+func (s *vlTestServer) urlWithAuth() string {
+	u, _ := url.Parse(s.server.URL)
+	u.User = url.UserPassword("user", "pass")
+	return u.String()
+}
+
+func newTestBatcher(s *vlTestServer) *vlBatcher {
+	return newVlBatcher(&http.Client{Timeout: time.Second}, s.urlWithAuth(), false)
+}
+
+func TestVlBatcherFlush(t *testing.T) {
+	s := newVlTestServer()
+	defer s.server.Close()
+	batcher := newTestBatcher(s)
+
+	batcher.Add(vlKindDoc, &RelayRequest{
 		Method: "POST",
 		Url:    "/myindex/_doc/123",
 		Headers: map[string][]string{
 			"Authorization": {"Basic ZWxhc3RpYzplcy1wYXNz"}, // original ES credentials, must not leak to VL
 		},
-		Body: []byte(`{"message":"test"}`),
+		Body: []byte(`{"message":"single doc"}`),
+	})
+	// bulk body without a trailing newline -> batcher must add one
+	batcher.Add(vlKindBulk, &RelayRequest{
+		Method: "POST",
+		Url:    "/_bulk",
+		Body:   []byte("{\"index\":{\"_index\":\"myindex\"}}\n{\"message\":\"bulk test\"}"),
+	})
+
+	if len(s.requests) != 0 {
+		t.Fatalf("expected no requests before flush, got %d", len(s.requests))
 	}
 
-	client := &http.Client{Timeout: time.Second}
-	if err := sendToVictoriaLogs(client, serverUrl.String(), vlKindDoc, req); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	batcher.Flush()
 
-	if gotPath != "/insert/elasticsearch/_bulk" {
-		t.Errorf("path = %q, want /insert/elasticsearch/_bulk", gotPath)
+	if len(s.requests) != 1 {
+		t.Fatalf("expected 1 request after flush, got %d", len(s.requests))
+	}
+	req := s.requests[0]
+	if req.path != "/insert/elasticsearch/_bulk" {
+		t.Errorf("path = %q, want /insert/elasticsearch/_bulk", req.path)
 	}
 	wantAuth := "Basic dXNlcjpwYXNz" // user:pass from victoriaLogsUrl
-	if gotAuth != wantAuth {
-		t.Errorf("Authorization = %q, want %q", gotAuth, wantAuth)
+	if req.auth != wantAuth {
+		t.Errorf("Authorization = %q, want %q", req.auth, wantAuth)
 	}
-	wantBody := "{\"create\":{\"_index\":\"myindex\"}}\n{\"message\":\"test\"}\n"
-	if gotBody != wantBody {
-		t.Errorf("body = %q, want %q", gotBody, wantBody)
+	wantBody := "{\"create\":{\"_index\":\"myindex\"}}\n{\"message\":\"single doc\"}\n" +
+		"{\"index\":{\"_index\":\"myindex\"}}\n{\"message\":\"bulk test\"}\n"
+	if req.body != wantBody {
+		t.Errorf("body = %q, want %q", req.body, wantBody)
+	}
+	if batcher.buf.Len() != 0 {
+		t.Errorf("buffer not empty after successful flush: %d bytes", batcher.buf.Len())
+	}
+}
+
+func TestVlBatcherFlushIfDue(t *testing.T) {
+	s := newVlTestServer()
+	defer s.server.Close()
+	batcher := newTestBatcher(s)
+
+	batcher.Add(vlKindDoc, &RelayRequest{
+		Method: "POST",
+		Url:    "/myindex/_doc/123",
+		Body:   []byte(`{"message":"test"}`),
+	})
+
+	batcher.FlushIfDue()
+	if len(s.requests) != 0 {
+		t.Fatalf("expected no flush before interval, got %d requests", len(s.requests))
+	}
+
+	batcher.lastFlush = time.Now().Add(-vlFlushInterval - time.Second)
+	batcher.FlushIfDue()
+	if len(s.requests) != 1 {
+		t.Fatalf("expected flush after interval, got %d requests", len(s.requests))
+	}
+}
+
+func TestVlBatcherFlushErrorKeepsBuffer(t *testing.T) {
+	s := newVlTestServer()
+	defer s.server.Close()
+	batcher := newTestBatcher(s)
+
+	batcher.Add(vlKindDoc, &RelayRequest{
+		Method: "POST",
+		Url:    "/myindex/_doc/123",
+		Body:   []byte(`{"message":"test"}`),
+	})
+
+	s.status = 500
+	batcher.Flush()
+	if batcher.buf.Len() == 0 {
+		t.Fatal("buffer dropped after failed flush")
+	}
+
+	s.status = 200
+	batcher.Flush()
+	if batcher.buf.Len() != 0 {
+		t.Fatal("buffer not empty after successful retry")
+	}
+	if len(s.requests) != 2 {
+		t.Fatalf("expected 2 requests, got %d", len(s.requests))
+	}
+	if s.requests[0].body != s.requests[1].body {
+		t.Errorf("retry body differs: %q vs %q", s.requests[0].body, s.requests[1].body)
 	}
 }

@@ -121,13 +121,20 @@ func buildVictoriaLogsBody(kind string, relayRequest *RelayRequest) ([]byte, err
 		return nil, err
 	}
 
+	parts := splitRequestPath(relayRequest.Url)
+
 	if kind == vlKindBulk {
 		// bulk body is already in the NDJSON format VictoriaLogs accepts
-		return transformBulkBody(rawBody), nil
+		defaultIndex := ""
+		if len(parts) == 2 {
+			// /<index>/_bulk
+			defaultIndex = parts[0]
+		}
+		return transformBulkBody(rawBody, defaultIndex), nil
 	}
 
 	// single _doc insert -> wrap into a one-item bulk payload
-	index := splitRequestPath(relayRequest.Url)[0]
+	index := parts[0]
 
 	var doc json.RawMessage
 	if err := json.Unmarshal(rawBody, &doc); err != nil {
@@ -137,7 +144,7 @@ func buildVictoriaLogsBody(kind string, relayRequest *RelayRequest) ([]byte, err
 	if err != nil {
 		return nil, err
 	}
-	docJson = ensureMsgField(docJson)
+	docJson = transformDocLine(docJson, index)
 
 	action, err := json.Marshal(map[string]map[string]string{
 		"create": {"_index": index},
@@ -157,23 +164,37 @@ func buildVictoriaLogsBody(kind string, relayRequest *RelayRequest) ([]byte, err
 // VictoriaLogs requires the _msg field in every document
 const vlDefaultMsg = "missing _msg"
 
-func ensureMsgField(doc []byte) []byte {
+// Adds the _msg field (fallback: "message" field, then vlDefaultMsg) and the
+// "index" stream field with the ES index name.
+func transformDocLine(doc []byte, index string) []byte {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(doc, &fields); err != nil {
 		// not an object -> leave it to VictoriaLogs
 		return doc
 	}
-	if _, ok := fields["_msg"]; ok {
+
+	changed := false
+
+	if _, ok := fields["_msg"]; !ok {
+		// fallback to the "message" field (only when it is a string)
+		if message, ok := fields["message"]; ok && len(message) > 0 && message[0] == '"' {
+			fields["_msg"] = message
+		} else {
+			fields["_msg"] = json.RawMessage(`"` + vlDefaultMsg + `"`)
+		}
+		changed = true
+	}
+
+	if index != "" {
+		if indexJson, err := json.Marshal(index); err == nil {
+			fields["index"] = indexJson
+			changed = true
+		}
+	}
+
+	if !changed {
 		return doc
 	}
-
-	// fallback to the "message" field (only when it is a string)
-	if message, ok := fields["message"]; ok && len(message) > 0 && message[0] == '"' {
-		fields["_msg"] = message
-	} else {
-		fields["_msg"] = json.RawMessage(`"` + vlDefaultMsg + `"`)
-	}
-
 	out, err := json.Marshal(fields)
 	if err != nil {
 		return doc
@@ -181,11 +202,13 @@ func ensureMsgField(doc []byte) []byte {
 	return out
 }
 
-// Adds the _msg field to document lines of a bulk body. Action lines
-// (create/index/delete/...) are kept as they are.
-func transformBulkBody(rawBody []byte) []byte {
+// Transforms document lines of a bulk body via transformDocLine. Action lines
+// (create/index/delete/...) are kept as they are; the ES index is taken from
+// the action line's _index, or from defaultIndex (/<index>/_bulk requests).
+func transformBulkBody(rawBody []byte, defaultIndex string) []byte {
 	var out bytes.Buffer
 	isDocLine := false
+	docIndex := defaultIndex
 	for _, line := range bytes.Split(rawBody, []byte("\n")) {
 		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
@@ -193,14 +216,22 @@ func transformBulkBody(rawBody []byte) []byte {
 		}
 
 		if isDocLine {
-			line = ensureMsgField(line)
+			line = transformDocLine(line, docIndex)
 			isDocLine = false
 		} else {
 			// action line; delete is not followed by a document line
-			var action map[string]json.RawMessage
+			var action map[string]struct {
+				Index string `json:"_index"`
+			}
 			isDelete := false
+			docIndex = defaultIndex
 			if err := json.Unmarshal(line, &action); err == nil {
 				_, isDelete = action["delete"]
+				for _, meta := range action {
+					if meta.Index != "" {
+						docIndex = meta.Index
+					}
+				}
 			}
 			isDocLine = !isDelete
 		}
@@ -252,7 +283,7 @@ type vlBatcher struct {
 func newVlBatcher(client *http.Client, victoriaLogsUrl string, debug bool) *vlBatcher {
 	return &vlBatcher{
 		client:    client,
-		url:       strings.TrimRight(victoriaLogsUrl, "/") + "/insert/elasticsearch/_bulk",
+		url:       strings.TrimRight(victoriaLogsUrl, "/") + "/insert/elasticsearch/_bulk?_stream_fields=index",
 		lastFlush: time.Now(),
 		debug:     debug,
 	}

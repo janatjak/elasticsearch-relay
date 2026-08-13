@@ -164,8 +164,22 @@ func buildVictoriaLogsBody(kind string, relayRequest *RelayRequest) ([]byte, err
 // VictoriaLogs requires the _msg field in every document
 const vlDefaultMsg = "missing _msg"
 
-// Adds the _msg field (fallback: "message" field, then vlDefaultMsg) and the
-// "index" stream field with the ES index name.
+// Maps Elasticsearch fields to their VictoriaLogs equivalents (the source
+// field is renamed, so the value is not stored twice).
+var vlFieldMapping = map[string]string{
+	"message":    "_msg",
+	"@timestamp": "_time",
+}
+
+func isScalarJson(value json.RawMessage) bool {
+	if len(value) == 0 {
+		return false
+	}
+	return value[0] == '"' || value[0] == '-' || (value[0] >= '0' && value[0] <= '9')
+}
+
+// Renames the fields from vlFieldMapping, makes sure _msg is present and adds
+// the "index" stream field with the ES index name.
 func transformDocLine(doc []byte, index string) []byte {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(doc, &fields); err != nil {
@@ -175,13 +189,22 @@ func transformDocLine(doc []byte, index string) []byte {
 
 	changed := false
 
-	if _, ok := fields["_msg"]; !ok {
-		// fallback to the "message" field (only when it is a string)
-		if message, ok := fields["message"]; ok && len(message) > 0 && message[0] == '"' {
-			fields["_msg"] = message
-		} else {
-			fields["_msg"] = json.RawMessage(`"` + vlDefaultMsg + `"`)
+	for esField, vlField := range vlFieldMapping {
+		value, ok := fields[esField]
+		// _msg and _time hold a string (or a unix timestamp), so objects and
+		// arrays are left in the original field
+		if !ok || !isScalarJson(value) {
+			continue
 		}
+		if _, exists := fields[vlField]; !exists {
+			fields[vlField] = value
+		}
+		delete(fields, esField)
+		changed = true
+	}
+
+	if _, ok := fields["_msg"]; !ok {
+		fields["_msg"] = json.RawMessage(`"` + vlDefaultMsg + `"`)
 		changed = true
 	}
 

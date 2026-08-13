@@ -46,7 +46,7 @@ func TestBuildVictoriaLogsBodyDoc(t *testing.T) {
 	req := &RelayRequest{
 		Method: "POST",
 		Url:    "/myindex/_doc/123?refresh=true",
-		Body:   []byte("{\n  \"message\": \"test\",\n  \"level\": \"info\"\n}"),
+		Body:   []byte("{\n  \"message\": \"test\",\n  \"@timestamp\": \"2026-08-13T12:00:00Z\",\n  \"level\": \"info\"\n}"),
 	}
 
 	body, err := buildVictoriaLogsBody(vlKindDoc, req)
@@ -54,7 +54,48 @@ func TestBuildVictoriaLogsBodyDoc(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	want := "{\"create\":{\"_index\":\"myindex\"}}\n{\"_msg\":\"test\",\"index\":\"myindex\",\"level\":\"info\",\"message\":\"test\"}\n"
+	want := "{\"create\":{\"_index\":\"myindex\"}}\n" +
+		"{\"_msg\":\"test\",\"_time\":\"2026-08-13T12:00:00Z\",\"index\":\"myindex\",\"level\":\"info\"}\n"
+	if string(body) != want {
+		t.Errorf("buildVictoriaLogsBody = %q, want %q", body, want)
+	}
+}
+
+func TestBuildVictoriaLogsBodyDocKeepsExistingVlFields(t *testing.T) {
+	// _msg and _time win; the ES fields are dropped so values are not stored twice
+	req := &RelayRequest{
+		Method: "POST",
+		Url:    "/myindex/_doc/123",
+		Body:   []byte(`{"message":"test","_msg":"already here","@timestamp":"2026-08-13T12:00:00Z","_time":"2020-01-01T00:00:00Z"}`),
+	}
+
+	body, err := buildVictoriaLogsBody(vlKindDoc, req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := "{\"create\":{\"_index\":\"myindex\"}}\n" +
+		"{\"_msg\":\"already here\",\"_time\":\"2020-01-01T00:00:00Z\",\"index\":\"myindex\"}\n"
+	if string(body) != want {
+		t.Errorf("buildVictoriaLogsBody = %q, want %q", body, want)
+	}
+}
+
+func TestBuildVictoriaLogsBodyDocNonScalarFields(t *testing.T) {
+	// objects/arrays cannot be used as _msg/_time -> left in the original field
+	req := &RelayRequest{
+		Method: "POST",
+		Url:    "/myindex/_doc/123",
+		Body:   []byte(`{"message":{"nested":"value"},"@timestamp":["2026-08-13T12:00:00Z"]}`),
+	}
+
+	body, err := buildVictoriaLogsBody(vlKindDoc, req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := "{\"create\":{\"_index\":\"myindex\"}}\n" +
+		"{\"@timestamp\":[\"2026-08-13T12:00:00Z\"],\"_msg\":\"missing _msg\",\"index\":\"myindex\",\"message\":{\"nested\":\"value\"}}\n"
 	if string(body) != want {
 		t.Errorf("buildVictoriaLogsBody = %q, want %q", body, want)
 	}
@@ -90,25 +131,7 @@ func TestBuildVictoriaLogsBodyBulkDefaultIndexFromPath(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	want := "{\"create\":{}}\n{\"_msg\":\"test\",\"index\":\"pathindex\",\"message\":\"test\"}\n"
-	if string(body) != want {
-		t.Errorf("buildVictoriaLogsBody = %q, want %q", body, want)
-	}
-}
-
-func TestBuildVictoriaLogsBodyDocWithMsg(t *testing.T) {
-	req := &RelayRequest{
-		Method: "POST",
-		Url:    "/myindex/_doc/123",
-		Body:   []byte(`{"message":"test","_msg":"already here"}`),
-	}
-
-	body, err := buildVictoriaLogsBody(vlKindDoc, req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	want := "{\"create\":{\"_index\":\"myindex\"}}\n{\"_msg\":\"already here\",\"index\":\"myindex\",\"message\":\"test\"}\n"
+	want := "{\"create\":{}}\n{\"_msg\":\"test\",\"index\":\"pathindex\"}\n"
 	if string(body) != want {
 		t.Errorf("buildVictoriaLogsBody = %q, want %q", body, want)
 	}
@@ -159,9 +182,9 @@ func TestBuildVictoriaLogsBodyBulkAddsMsg(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	want := "{\"index\":{\"_index\":\"myindex\"}}\n{\"_msg\":\"bulk test\",\"index\":\"myindex\",\"message\":\"bulk test\"}\n" +
+	want := "{\"index\":{\"_index\":\"myindex\"}}\n{\"_msg\":\"bulk test\",\"index\":\"myindex\"}\n" +
 		"{\"delete\":{\"_index\":\"myindex\",\"_id\":\"1\"}}\n" +
-		"{\"create\":{}}\n{\"_msg\":\"second\",\"message\":\"second\"}\n"
+		"{\"create\":{}}\n{\"_msg\":\"second\"}\n"
 	if string(body) != want {
 		t.Errorf("bulk body = %q, want %q", body, want)
 	}
@@ -287,8 +310,8 @@ func TestVlBatcherFlush(t *testing.T) {
 	if req.auth != wantAuth {
 		t.Errorf("Authorization = %q, want %q", req.auth, wantAuth)
 	}
-	wantBody := "{\"create\":{\"_index\":\"myindex\"}}\n{\"_msg\":\"single doc\",\"index\":\"myindex\",\"message\":\"single doc\"}\n" +
-		"{\"index\":{\"_index\":\"myindex\"}}\n{\"_msg\":\"bulk test\",\"index\":\"myindex\",\"message\":\"bulk test\"}\n"
+	wantBody := "{\"create\":{\"_index\":\"myindex\"}}\n{\"_msg\":\"single doc\",\"index\":\"myindex\"}\n" +
+		"{\"index\":{\"_index\":\"myindex\"}}\n{\"_msg\":\"bulk test\",\"index\":\"myindex\"}\n"
 	if req.body != wantBody {
 		t.Errorf("body = %q, want %q", req.body, wantBody)
 	}
